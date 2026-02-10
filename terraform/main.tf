@@ -1,17 +1,23 @@
-##############################
-# DATA SOURCES (EXISTING VPC)
-##############################
+######################################
+# DATA SOURCES
+######################################
 
+# Use your existing VPC (change tag if needed)
 data "aws_vpc" "selected" {
   filter {
     name   = "tag:Name"
-    values = ["default"]   # <-- change if your VPC name is different
+    values = ["default"]
   }
 }
 
-##############################
+# Latest ECS-optimized AMI
+data "aws_ssm_parameter" "ecs_ami" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id"
+}
+
+######################################
 # ECS CLUSTER
-##############################
+######################################
 
 resource "aws_ecs_cluster" "main" {
   name = "prod-ecs-cluster"
@@ -22,11 +28,11 @@ resource "aws_ecs_cluster" "main" {
   }
 }
 
-##############################
-# IAM ROLES (LEAST PRIVILEGE)
-##############################
+######################################
+# IAM ROLES
+######################################
 
-# Execution role (pull images + read SSM)
+# ----- ECS TASK EXECUTION ROLE -----
 resource "aws_iam_role" "ecs_execution_role" {
   name = "ecs-execution-role"
 
@@ -45,7 +51,7 @@ resource "aws_iam_role_policy_attachment" "ecs_exec_attach" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Task role (app identity + SSM access)
+# ----- ECS TASK ROLE (APP IDENTITY) -----
 resource "aws_iam_role" "ecs_task_role" {
   name = "ecs-task-role"
 
@@ -73,12 +79,42 @@ resource "aws_iam_role_policy" "ssm_read_policy" {
   })
 }
 
-##############################
+# ----- ECS EC2 INSTANCE ROLE -----
+resource "aws_iam_role" "ecs_instance_role" {
+  name = "ecs-instance-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_instance_attach" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_instance_profile" "ecs_instance_profile" {
+  name = "ecs-instance-profile"
+  role = aws_iam_role.ecs_instance_role.name
+}
+
+######################################
 # LAUNCH TEMPLATE (NO PUBLIC IP)
-##############################
+######################################
 
 resource "aws_launch_template" "ecs_lt" {
   name = "ecs-ec2-lt"
+
+  image_id = data.aws_ssm_parameter.ecs_ami.value
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ecs_instance_profile.name
+  }
 
   network_interfaces {
     associate_public_ip_address = false
@@ -92,9 +128,9 @@ EOF
   )
 }
 
-##############################
+######################################
 # AUTO SCALING GROUP (MIXED)
-##############################
+######################################
 
 resource "aws_autoscaling_group" "ecs_asg" {
   name                = "ecs-asg"
@@ -102,6 +138,9 @@ resource "aws_autoscaling_group" "ecs_asg" {
   desired_capacity    = 2
   min_size            = 2
   max_size            = 10
+
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
 
   mixed_instances_policy {
     instances_distribution {
@@ -119,9 +158,9 @@ resource "aws_autoscaling_group" "ecs_asg" {
   }
 }
 
-##############################
+######################################
 # ECS CAPACITY PROVIDER
-##############################
+######################################
 
 resource "aws_ecs_capacity_provider" "ecs_cp" {
   name = "ecs-capacity-provider"
@@ -147,9 +186,9 @@ resource "aws_ecs_cluster_capacity_providers" "cp" {
   }
 }
 
-##############################
+######################################
 # APPLICATION LOAD BALANCER
-##############################
+######################################
 
 resource "aws_lb" "alb" {
   name               = "prod-alb"
@@ -185,9 +224,9 @@ resource "aws_lb_listener" "listener" {
   }
 }
 
-##############################
+######################################
 # ECS TASK DEFINITION
-##############################
+######################################
 
 resource "aws_ecs_task_definition" "nginx" {
   family                   = "nginx-task"
@@ -214,27 +253,12 @@ resource "aws_ecs_task_definition" "nginx" {
   }])
 }
 
-##############################
+######################################
 # ECS SERVICE (ZERO DOWNTIME)
-##############################
+######################################
 
 resource "aws_ecs_service" "nginx_svc" {
   name            = "nginx-service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.nginx.arn
-  desired_count   = 4
-
-  capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.ecs_cp.name
-    weight            = 1
-  }
-
-  deployment_minimum_healthy_percent = 100
-  deployment_maximum_percent         = 200
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.tg.arn
-    container_name   = "nginx"
-    container_port   = 80
-  }
-}
+  desire
